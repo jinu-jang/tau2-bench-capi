@@ -74,8 +74,12 @@ experiments = [
     "seaborn>=0.13.2",
     "scikit-learn>=1.6.1",
 ]
+capi = [
+    "azure-identity>=1.25.3",
+    "azure-keyvault-secrets>=4.10.0",
+]
 all = [
-    "tau2[voice,knowledge,gym,dev,experiments]",
+    "tau2[voice,knowledge,gym,dev,experiments,capi]",
 ]
 [project.urls]
 Homepage = "https://taubench.com/"
