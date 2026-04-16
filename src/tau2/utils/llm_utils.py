@@ -102,6 +102,185 @@ else:
     logger.info("LiteLLM: Cache is disabled")
     litellm.disable_cache()
 
+"""
+Claude -> OpenAI converter
+"""
+
+from litellm.types.utils import (
+    ModelResponse,
+    Choices,
+    Message,
+    ChatCompletionMessageToolCall,
+    Function,
+    Usage,
+    CompletionTokensDetailsWrapper,
+    PromptTokensDetailsWrapper,
+)
+import uuid
+
+
+def _gen_id():
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def convert_claude_to_model_response(resp: dict, model: str) -> ModelResponse:
+    all_tool_calls = []
+    content_parts = []
+
+    # 🔥 Extract BOTH tool_calls and content
+    for c in resp.get("choices", []):
+        msg = c.get("message", {})
+
+        if msg.get("tool_calls"):
+            all_tool_calls.extend(msg["tool_calls"])
+
+        if msg.get("content"):
+            content_parts.append(msg["content"])
+
+    # 🔥 Convert tool calls if present
+    converted_tool_calls = [
+        ChatCompletionMessageToolCall(
+            id=_gen_id(),
+            type="function",
+            function=Function(
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
+            ),
+        )
+        for tc in all_tool_calls
+    ]
+
+    # 🔥 Decide message type
+    if converted_tool_calls:
+        message = Message(
+            role="assistant",
+            content=None,
+            tool_calls=converted_tool_calls,
+            function_call=None,
+            provider_specific_fields={"refusal": None},
+            annotations=[],
+        )
+        finish_reason = "tool_calls"
+    else:
+        message = Message(
+            role="assistant",
+            content=" ".join(content_parts) if content_parts else "",
+            tool_calls=[],  # ✅ IMPORTANT: must be list
+            function_call=None,
+            provider_specific_fields={"refusal": None},
+            annotations=[],
+        )
+        finish_reason = "stop"
+
+    # 🔥 Build choice
+    choice = Choices(
+        index=0,
+        finish_reason=finish_reason,
+        message=message,
+        provider_specific_fields={"content_filter_results": {}},
+    )
+
+    # 🔥 Usage
+    usage_raw = resp.get("usage", {})
+
+    usage = Usage(
+        prompt_tokens=usage_raw.get("prompt_tokens", 0),
+        completion_tokens=usage_raw.get("completion_tokens", 0),
+        total_tokens=usage_raw.get("total_tokens", 0),
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            accepted_prediction_tokens=0,
+            audio_tokens=0,
+            reasoning_tokens=0,
+            rejected_prediction_tokens=0,
+            text_tokens=None,
+            image_tokens=None,
+            video_tokens=None,
+        ),
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            audio_tokens=0,
+            cached_tokens=usage_raw.get("prompt_tokens_details", {}).get("cached_tokens", 0),
+            text_tokens=None,
+            image_tokens=None,
+            video_tokens=None,
+        ),
+    )
+
+    return ModelResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=resp.get("created"),
+        model=model,
+        object="chat.completion",
+        system_fingerprint=None,
+        choices=[choice],
+        usage=usage,
+        service_tier=None,
+        prompt_filter_results=[{
+            "prompt_index": 0,
+            "content_filter_results": {
+                "hate": {"filtered": False, "severity": "safe"},
+                "jailbreak": {"filtered": False, "detected": False},
+                "self_harm": {"filtered": False, "severity": "safe"},
+                "sexual": {"filtered": False, "severity": "safe"},
+                "violence": {"filtered": False, "severity": "safe"},
+            },
+        }],
+    )
+
+"""
+GitHub CAPI Support
+"""
+
+import hashlib
+import hmac
+import requests
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+
+
+KEYVAULT_URL = os.environ.get("KEYVAULT_URL", "https://model-router-eval-kv.vault.azure.net/")
+KEYVAULT_SECRET_NAME = os.environ.get("KEYVAULT_SECRET_NAME", "capi-hmac")
+INTEGRATION_ID = os.environ.get("COPILOT_INTEGRATION_ID", "msft-router-dev")
+
+
+def get_capi_key() -> bytes:
+    credential = DefaultAzureCredential()
+    client = SecretClient(vault_url=KEYVAULT_URL, credential=credential)
+    key = client.get_secret(KEYVAULT_SECRET_NAME).value.strip().encode('utf8')
+    return key
+
+
+def build_hmac_header() -> str:
+    current = str(int(time.time()))
+    hmac_value = hmac.new(get_capi_key(), current.encode('utf8'), hashlib.sha256).hexdigest()
+    request_hmac = f'{current}.{hmac_value}'
+    return request_hmac
+
+
+def get_headers() -> dict:
+    hmac_header = build_hmac_header()
+    return {
+        "Request-Hmac": hmac_header,
+        "Copilot-Integration-Id": INTEGRATION_ID,
+        "Content-Type": "application/json",
+    }
+
+def chat_completion(model: str, messages: list, tools: list = None, tool_choice: str = None, **kwargs) -> dict:
+    resp = requests.post(
+        "https://api.githubcopilot.com/chat/completions",
+        headers=get_headers(),
+        json={
+            "model": model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            **kwargs,
+        },
+    )
+    if not resp.ok:
+        print(f"Error {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+    return resp.json()
+
 
 def _parse_ft_model_name(model: str) -> str:
     """
@@ -126,7 +305,7 @@ def get_response_cost(response: ModelResponse) -> float:
     try:
         cost = completion_cost(completion_response=response)
     except Exception as e:
-        logger.error(e)
+        # logger.error(e)
         return 0.0
     return cost
 
@@ -406,15 +585,29 @@ def generate(
 
     start_time = time.perf_counter()
     try:
-        response = completion(
-            model=model,
-            messages=litellm_messages,
-            tools=tools_schema,
-            tool_choice=tool_choice,
-            **kwargs,
-        )
+        experimental_use_github_capi = os.environ.get("EXPERIMENTAL_USE_GITHUB_CAPI", "false").lower() == "true"
+        if experimental_use_github_capi and model.startswith("capi/"):
+            # strip capi from model name before passing to GitHub CAPI
+            capi_compatible_model = model[len("capi/") :]
+            response = chat_completion(
+                model=capi_compatible_model,
+                messages=litellm_messages,
+                tools=tools_schema,
+                tool_choice=tool_choice,
+                **kwargs,
+            )
+            response = convert_claude_to_model_response(response, capi_compatible_model)
+        else:
+            response = completion(
+                model=model,
+                messages=litellm_messages,
+                tools=tools_schema,
+                tool_choice=tool_choice,
+                **kwargs,
+            )
     except Exception as e:
-        logger.error(e)
+        logger.error(f"LLM generation failed for model {model} with error: {e}")
+        # logger.error(e)
         raise e
     generation_time_seconds = time.perf_counter() - start_time
     cost = get_response_cost(response)
